@@ -1,0 +1,33 @@
+name: heart-disease-classification
+
+conda_env: conda.yaml
+
+entry_points:
+  main:
+    parameters:
+      n_estimators:
+        type: int
+        default: 200
+      max_depth:
+        type: int
+        default: 5
+      learning_rate:
+        type: float
+        default: 0.1
+      subsample:
+        type: float
+        default: 0.8
+      colsample_bytree:
+        type: float
+        default: 0.8
+      random_state:
+        type: int
+        default: 42
+    command: >
+      python modelling.py
+      --n_estimators {n_estimators}
+      --max_depth {max_depth}
+      --learning_rate {learning_rate}
+      --subsample {subsample}
+      --colsample_bytree {colsample_bytree}
+      --random_state {random_state}

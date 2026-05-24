@@ -1,0 +1,191 @@
+name: CI - Train and Deploy Heart Disease Model
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'MLProject/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      n_estimators:
+        description: 'Number of estimators'
+        required: false
+        default: '200'
+      max_depth:
+        description: 'Max tree depth'
+        required: false
+        default: '5'
+      learning_rate:
+        description: 'Learning rate'
+        required: false
+        default: '0.1'
+
+env:
+  MLFLOW_TRACKING_URI: https://dagshub.com/dimasmail0101/Heart-Disease-MLflow.mlflow
+  MLFLOW_TRACKING_USERNAME: dimasmail0101
+  MLFLOW_TRACKING_PASSWORD: ${{ secrets.DAGSHUB_TOKEN }}
+  DOCKER_IMAGE: dimaseka83/heart-disease-model
+
+jobs:
+  train:
+    name: Train Model with MLflow Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.7'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlflow==2.19.0 pandas numpy scikit-learn xgboost \
+                      matplotlib seaborn dagshub
+
+      - name: Verify Dataset Exists
+        run: |
+          echo "=== Cek dataset ==="
+          ls -lh MLProject/heart_disease_preprocessing/
+          python -c "
+          import pandas as pd
+          train = pd.read_csv('MLProject/heart_disease_preprocessing/train.csv')
+          test  = pd.read_csv('MLProject/heart_disease_preprocessing/test.csv')
+          print(f'Train: {train.shape}, Test: {test.shape}')
+          assert train.isnull().sum().sum() == 0
+          print('Dataset OK!')
+          "
+
+      - name: Run MLflow Project
+        run: |
+          mlflow run MLProject/ \
+            -P n_estimators=${{ github.event.inputs.n_estimators || 200 }} \
+            -P max_depth=${{ github.event.inputs.max_depth || 5 }} \
+            -P learning_rate=${{ github.event.inputs.learning_rate || 0.1 }} \
+            --env-manager=local
+
+      - name: Export Best Model Artifacts
+        run: |
+          python -c "
+          import mlflow, os
+          client = mlflow.tracking.MlflowClient()
+          experiment = client.get_experiment_by_name('Heart-Disease-CI')
+          if experiment:
+              runs = client.search_runs(
+                  experiment_ids=[experiment.experiment_id],
+                  order_by=['metrics.roc_auc DESC'],
+                  max_results=1
+              )
+              if runs:
+                  run = runs[0]
+                  run_id = run.info.run_id
+                  print(f'Best run: {run_id}')
+                  print(f'ROC AUC : {run.data.metrics.get(\"roc_auc\", 0):.4f}')
+                  print(f'Accuracy: {run.data.metrics.get(\"accuracy\", 0):.4f}')
+                  os.makedirs('model_artifacts', exist_ok=True)
+                  client.download_artifacts(run_id, 'model', 'model_artifacts/')
+                  client.download_artifacts(run_id, 'plots', 'model_artifacts/')
+                  print('Artifacts exported!')
+          "
+
+      - name: Upload Artifacts to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts-${{ github.run_number }}
+          path: model_artifacts/
+          retention-days: 90
+
+      - name: Save Artifacts to Repository
+        run: |
+          mkdir -p saved_models/run-${{ github.run_number }}
+          cp -r model_artifacts/ saved_models/run-${{ github.run_number }}/
+          echo "Run    : ${{ github.run_number }}" > saved_models/run-${{ github.run_number }}/run_info.txt
+          echo "Commit : ${{ github.sha }}"        >> saved_models/run-${{ github.run_number }}/run_info.txt
+          echo "Date   : $(date -u)"               >> saved_models/run-${{ github.run_number }}/run_info.txt
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Actions"
+          git add saved_models/
+          git diff --staged --quiet || git commit -m "ci: save model artifacts run #${{ github.run_number }} [skip ci]"
+          git push || echo "Nothing to push"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-docker:
+    name: Build and Push Docker Image
+    needs: train
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Model Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts-${{ github.run_number }}
+          path: model_artifacts/
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Create Dockerfile manually
+        run: |
+          cat > Dockerfile << 'EOF'
+          FROM python:3.12-slim
+
+          WORKDIR /app
+
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              gcc g++ && rm -rf /var/lib/apt/lists/*
+
+          COPY model_artifacts/model /app/model
+
+          RUN pip install --no-cache-dir \
+              mlflow==2.19.0 \
+              scikit-learn \
+              xgboost \
+              pandas \
+              numpy
+
+          EXPOSE 8080
+
+          CMD ["mlflow", "models", "serve", \
+               "--model-uri", "/app/model", \
+               "--host", "0.0.0.0", \
+               "--port", "8080", \
+               "--no-conda"]
+          EOF
+          echo "Dockerfile created!"
+          cat Dockerfile
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ env.DOCKER_IMAGE }}:latest \
+                       -t ${{ env.DOCKER_IMAGE }}:${{ github.run_number }} .
+          echo "Docker image built!"
+
+      - name: Push Docker Image to Docker Hub
+        run: |
+          docker push ${{ env.DOCKER_IMAGE }}:latest
+          docker push ${{ env.DOCKER_IMAGE }}:${{ github.run_number }}
+          echo "Image pushed: ${{ env.DOCKER_IMAGE }}:${{ github.run_number }}"
+
+      - name: Save Docker Hub Link
+        run: |
+          echo "https://hub.docker.com/r/${{ env.DOCKER_IMAGE }}" > MLProject/docker_hub_link.txt
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Actions"
+          git add MLProject/docker_hub_link.txt
+          git diff --staged --quiet || git commit -m "ci: update docker hub link [skip ci]"
+          git push || echo "Nothing to push"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
